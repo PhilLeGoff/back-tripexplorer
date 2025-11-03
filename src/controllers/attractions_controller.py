@@ -7,8 +7,8 @@ from ..services.attractions_service import AttractionsService
 
 class AttractionsController:
     @staticmethod
-    def popular_by_country(country: str, limit: int = 20):
-        return AttractionsService.popular_by_country(country, limit)
+    def popular_by_country(country: str, limit: int = 20, profile: str = 'tourist', city: str = None):
+        return AttractionsService.popular_by_country(country, limit, profile, city=city)
 
     @staticmethod
     def search(params: Dict[str, Any]):

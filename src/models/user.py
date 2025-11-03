@@ -17,6 +17,7 @@ class User(me.Document):
     # Preferences persisted per user
     selected_profile = me.StringField(choices=('local', 'tourist', 'pro'), default='tourist')
     selected_country = me.StringField(default='France')
+    selected_city = me.StringField(default='')
 
     meta = {
         'indexes': [

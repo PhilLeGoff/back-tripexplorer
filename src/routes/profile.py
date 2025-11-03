@@ -15,6 +15,7 @@ class ProfileViewSet(viewsets.ViewSet):
         data = request.data or {}
         profile = data.get('profile')
         country = data.get('country')
+        city = data.get('city')
         updated = False
         if profile and profile in ('local', 'tourist', 'pro'):
             user.selected_profile = profile
@@ -22,11 +23,22 @@ class ProfileViewSet(viewsets.ViewSet):
         if country:
             user.selected_country = country
             updated = True
+        if city is not None:
+            user.selected_city = city
+            updated = True
         if updated:
             user.save()
-        return Response({'profile': user.selected_profile, 'country': user.selected_country})
+        return Response({
+            'profile': user.selected_profile,
+            'country': user.selected_country,
+            'city': user.selected_city
+        })
 
     @action(detail=False, methods=['get'])
     def me(self, request):
         user = request.user
-        return Response({'profile': user.selected_profile, 'country': user.selected_country})
+        return Response({
+            'profile': user.selected_profile,
+            'country': user.selected_country,
+            'city': user.selected_city
+        })

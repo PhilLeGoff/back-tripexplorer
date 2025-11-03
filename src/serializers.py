@@ -7,6 +7,13 @@ except Exception:
     DocumentSerializer = None
     MONGOENGINE_SERIALIZER_AVAILABLE = False
 
+try:
+    from bson import ObjectId
+    BSON_AVAILABLE = True
+except ImportError:
+    ObjectId = None
+    BSON_AVAILABLE = False
+
 from .models import Attraction, Compilation, CompilationItem, User
 
 
@@ -72,14 +79,59 @@ if MONGOENGINE_SERIALIZER_AVAILABLE:
             model = CompilationItem
             fields = ('attraction', 'order_index', 'added_at')
 
+        def _sanitize_objectids(self, obj):
+            """Recursively convert ObjectId instances to strings."""
+            if obj is None:
+                return None
+            # Check if it's an ObjectId - use isinstance if available
+            if BSON_AVAILABLE and isinstance(obj, ObjectId):
+                return str(obj)
+            # Fallback: check by class name
+            obj_class_name = getattr(obj, '__class__', None)
+            if obj_class_name:
+                class_name = getattr(obj_class_name, '__name__', '')
+                if class_name == 'ObjectId' or 'ObjectId' in str(type(obj)):
+                    return str(obj)
+            if isinstance(obj, dict):
+                return {k: self._sanitize_objectids(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [self._sanitize_objectids(item) for item in obj]
+            if isinstance(obj, tuple):
+                return tuple(self._sanitize_objectids(item) for item in obj)
+            if isinstance(obj, set):
+                return {self._sanitize_objectids(item) for item in obj}
+            return obj
+
         def to_representation(self, obj):
             data = super().to_representation(obj)
+            
+            # Immediately sanitize the raw data from super() to catch any ObjectIds
+            data = self._sanitize_objectids(data)
+            
             # Ensure nested attraction is fully serialized (not ObjectId)
             try:
-                if getattr(obj, 'attraction', None) is not None:
-                    data['attraction'] = AttractionSerializer(obj.attraction).data
-            except Exception:
-                pass
+                attraction = getattr(obj, 'attraction', None)
+                if attraction is not None:
+                    # Try to access the attraction to see if reference is valid
+                    try:
+                        _ = attraction.id  # Force dereference to check if valid
+                        attraction_data = AttractionSerializer(attraction).data
+                        # Sanitize any ObjectIds in attraction data
+                        data['attraction'] = self._sanitize_objectids(attraction_data)
+                    except Exception:
+                        # Reference is broken or attraction doesn't exist
+                        # Keep only the ID if available
+                        try:
+                            att_id = str(attraction.id) if hasattr(attraction, 'id') else None
+                            data['attraction'] = {'id': att_id} if att_id else None
+                        except Exception:
+                            data['attraction'] = None
+            except Exception as e:
+                # If anything fails, set attraction to None
+                data['attraction'] = None
+            
+            # Final sanitization pass (double pass for safety)
+            data = self._sanitize_objectids(data)
             return data
 
     class CompilationSerializer(DocumentSerializer):
@@ -89,16 +141,81 @@ if MONGOENGINE_SERIALIZER_AVAILABLE:
             model = Compilation
             fields = ('id', 'name', 'profile', 'country', 'items', 'created_at', 'updated_at')
 
+        def _sanitize_objectids(self, obj):
+            """Recursively convert ObjectId instances to strings."""
+            if obj is None:
+                return None
+            # Check if it's an ObjectId - use isinstance if available
+            if BSON_AVAILABLE and isinstance(obj, ObjectId):
+                return str(obj)
+            # Fallback: check by class name
+            obj_class_name = getattr(obj, '__class__', None)
+            if obj_class_name:
+                class_name = getattr(obj_class_name, '__name__', '')
+                if class_name == 'ObjectId' or 'ObjectId' in str(type(obj)):
+                    return str(obj)
+            # Handle dictionaries
+            if isinstance(obj, dict):
+                return {k: self._sanitize_objectids(v) for k, v in obj.items()}
+            # Handle lists
+            if isinstance(obj, list):
+                return [self._sanitize_objectids(item) for item in obj]
+            # Handle tuples
+            if isinstance(obj, tuple):
+                return tuple(self._sanitize_objectids(item) for item in obj)
+            # Handle sets
+            if isinstance(obj, set):
+                return {self._sanitize_objectids(item) for item in obj}
+            return obj
+
         def to_representation(self, obj):
             data = super().to_representation(obj)
-            # Ensure id is a string for JSON encoding
-            if 'id' in data and data['id'] is not None:
-                data['id'] = str(data['id'])
+            # Ensure id is a string for JSON encoding (must be done before sanitization)
+            if 'id' in data:
+                if data['id'] is not None:
+                    data['id'] = str(data['id'])
+                else:
+                    data['id'] = None
+            
             # Normalize items using our item serializer to avoid raw ObjectIds
             try:
-                data['items'] = [CompilationItemSerializer(item).data for item in getattr(obj, 'items', [])]
+                items_data = []
+                for item in getattr(obj, 'items', []):
+                    try:
+                        item_data = CompilationItemSerializer(item).data
+                        # Sanitize any ObjectIds in the item data
+                        item_data = self._sanitize_objectids(item_data)
+                        items_data.append(item_data)
+                    except Exception:
+                        # Skip items that can't be serialized
+                        continue
+                data['items'] = items_data
             except Exception:
-                pass
+                data['items'] = []
+            
+            # Final pass: sanitize all ObjectIds in the entire data structure
+            # This must be done recursively and comprehensively
+            data = self._sanitize_objectids(data)
+            
+            # Extra safety: manually check and convert any remaining ObjectIds
+            def deep_sanitize(d):
+                """Deep recursive sanitization as final safety net."""
+                if d is None:
+                    return None
+                if BSON_AVAILABLE and isinstance(d, ObjectId):
+                    return str(d)
+                if isinstance(d, dict):
+                    return {k: deep_sanitize(v) for k, v in d.items()}
+                if isinstance(d, (list, tuple)):
+                    return type(d)(deep_sanitize(item) for item in d)
+                if isinstance(d, set):
+                    return {deep_sanitize(item) for item in d}
+                # Last resort: check if it looks like an ObjectId
+                if hasattr(d, '__class__') and 'ObjectId' in str(type(d)):
+                    return str(d)
+                return d
+            
+            data = deep_sanitize(data)
             return data
 
 else:
@@ -189,10 +306,33 @@ class SignUpSerializer(serializers.Serializer):
     first_name = serializers.CharField(required=False, allow_blank=True)
     last_name = serializers.CharField(required=False, allow_blank=True)
     password = serializers.CharField(write_only=True, min_length=8)
+    profile = serializers.ChoiceField(choices=['tourist', 'local', 'pro'], required=False, default='tourist')
+    selected_country = serializers.CharField(required=False, default='France')
+    selected_city = serializers.CharField(required=False, allow_blank=True, default='')
+    selected_profile = serializers.CharField(read_only=True)
+    selected_country_serialized = serializers.CharField(read_only=True, source='selected_country')
+
+    def to_representation(self, instance):
+        """Return user data including profile, country, and city."""
+        return {
+            'id': str(getattr(instance, 'id', '')),
+            'email': getattr(instance, 'email', ''),
+            'first_name': getattr(instance, 'first_name', ''),
+            'last_name': getattr(instance, 'last_name', ''),
+            'selected_profile': getattr(instance, 'selected_profile', 'tourist'),
+            'selected_country': getattr(instance, 'selected_country', 'France'),
+            'selected_city': getattr(instance, 'selected_city', ''),
+        }
 
     def create(self, validated_data):
         password = validated_data.pop('password')
+        profile = validated_data.pop('profile', 'tourist')
+        selected_country = validated_data.pop('selected_country', 'France')
+        selected_city = validated_data.pop('selected_city', '')
         user = User(**validated_data)
+        user.selected_profile = profile
+        user.selected_country = selected_country
+        user.selected_city = selected_city
         user.set_password(password)
         user.save()
         return user

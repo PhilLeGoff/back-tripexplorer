@@ -157,6 +157,11 @@ CORS_ALLOW_ALL_ORIGINS = True
 REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # Custom JSON renderer to handle MongoDB ObjectId
+    'DEFAULT_RENDERER_CLASSES': [
+        'src.json_renderer.MongoJSONRenderer',
+        'rest_framework.renderers.JSONRenderer',
+    ],
 }
 
 # Optional: Add JWT authentication if rest_framework_simplejwt is installed
@@ -186,7 +191,7 @@ try:
     from datetime import timedelta
     import rest_framework_simplejwt
     SIMPLE_JWT = {
-        'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+        'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
         'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
         'AUTH_HEADER_TYPES': ('Bearer',),
     }

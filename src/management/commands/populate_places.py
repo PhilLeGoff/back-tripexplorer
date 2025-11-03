@@ -1,6 +1,7 @@
 from django.core.management.base import BaseCommand
 from src.models import Attraction
 from src.external_services import google_places_service
+from src.services.attractions_service import AttractionsService
 import logging
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ class Command(BaseCommand):
                     'longitude': longitude,
                     'website': details.get('website', ''),
                     'phone_number': details.get('formatted_phone_number', ''),
-                    'opening_hours': details.get('opening_hours', {}),
+                    'opening_hours': AttractionsService._filter_opening_hours(details.get('opening_hours')),
                     'reviews': details.get('reviews', []),
                     'raw_data': details,
                     'is_featured': details.get('rating', 0) >= 4.0,

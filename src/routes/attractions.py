@@ -28,7 +28,12 @@ class AttractionViewSet(viewsets.ViewSet):
             if not q and not lat:
                 country = country or 'France'
                 limit = int(params.get('limit', 20))
-                qs = AttractionsController.popular_by_country(country, limit)
+                # Get profile from user or default
+                user = getattr(request, 'user', None)
+                profile = 'tourist'
+                if user and hasattr(user, 'selected_profile'):
+                    profile = user.selected_profile or 'tourist'
+                qs = AttractionsController.popular_by_country(country, limit, profile)
                 if qs and isinstance(qs, list) and len(qs) and isinstance(qs[0], dict):
                     return Response(qs, status=status.HTTP_200_OK)
                 attractions = list(qs)
@@ -36,7 +41,13 @@ class AttractionViewSet(viewsets.ViewSet):
                 return Response(serializer.data, status=status.HTTP_200_OK)
 
             # Use search service for browsing — this will hit Google Places when no DB filters
-            results = AttractionsController.search(request.query_params)
+            search_params = request.query_params.copy()
+            user = getattr(request, 'user', None)
+            if user and hasattr(user, 'selected_profile'):
+                search_params['profile'] = user.selected_profile or 'tourist'
+            elif 'profile' not in search_params:
+                search_params['profile'] = 'tourist'
+            results = AttractionsController.search(search_params)
             # If service returned plain dicts (from Google Places mapping), return directly
             if results and isinstance(results, list) and len(results) and isinstance(results[0], dict):
                 return Response(results, status=status.HTTP_200_OK)
@@ -65,7 +76,12 @@ class AttractionViewSet(viewsets.ViewSet):
         try:
             country = request.query_params.get('country', 'France')
             limit = int(request.query_params.get('limit', 20))
-            qs = AttractionsController.popular_by_country(country, limit)
+            profile = request.query_params.get('profile', 'tourist')
+            # Get profile from authenticated user if available, otherwise use query param
+            user = getattr(request, 'user', None)
+            if user and hasattr(user, 'selected_profile'):
+                profile = user.selected_profile or profile
+            qs = AttractionsController.popular_by_country(country, limit, profile)
             # popular_by_country returns mapped dicts from Google Places
             if qs and isinstance(qs, list) and len(qs) and isinstance(qs[0], dict):
                 return Response(qs, status=status.HTTP_200_OK)
@@ -80,22 +96,56 @@ class AttractionViewSet(viewsets.ViewSet):
     def search(self, request):
         try:
             # If no query and no location provided, fall back to popular results to populate UI
-            params = request.query_params
+            params = request.query_params.copy()  # Make mutable copy
             q = params.get('q') or params.get('query')
             lat = params.get('lat') or params.get('latitude') or params.get('location')
             country = params.get('country')
+            category = params.get('category')  # Check if filters are applied
+            
+            # Get profile from query param first (most accurate), then fall back to authenticated user, then default
+            user = getattr(request, 'user', None)
+            if 'profile' in params and params.get('profile'):
+                # Use profile from query params (sent by frontend based on localStorage)
+                params['profile'] = params.get('profile')
+            elif user and hasattr(user, 'selected_profile') and user.selected_profile:
+                # Fall back to user's database profile if query param not provided
+                params['profile'] = user.selected_profile
+            else:
+                # Default to tourist if nothing else available
+                params['profile'] = 'tourist'
 
+            # Get city from query params if available
+            city = params.get('city')
+
+            # CRITICAL FIX: When filters (category, min_rating, maxPrice) are applied,
+            # we MUST use search() method, not popular_by_country(), so filters get processed
+            has_filters = bool(category or params.get('min_rating') or params.get('minRating') or 
+                              params.get('price_level') or params.get('maxPrice'))
+            
             if not q and not lat:
-                country = country or 'France'
-                limit = int(params.get('limit', 20))
-                qs = AttractionsController.popular_by_country(country, limit)
-                if qs and isinstance(qs, list) and len(qs) and isinstance(qs[0], dict):
-                    return Response(qs, status=status.HTTP_200_OK)
-                attractions = list(qs)
-                serializer = self.serializer_class(attractions, many=True)
-                return Response(serializer.data, status=status.HTTP_200_OK)
+                # If filters are applied, use search() method to handle them
+                # Otherwise, fall back to popular_by_country for faster results
+                if has_filters:
+                    # Filters present - use search() which will handle category, rating, price filters
+                    results = AttractionsController.search(params)
+                    if results and isinstance(results, list) and len(results) and isinstance(results[0], dict):
+                        return Response(results, status=status.HTTP_200_OK)
+                    attractions = list(results) if results else []
+                    serializer = self.serializer_class(attractions, many=True)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+                else:
+                    # No filters - use faster popular_by_country method
+                    country = country or 'France'
+                    limit = int(params.get('limit', 20))
+                    qs = AttractionsController.popular_by_country(country, limit, params.get('profile', 'tourist'), city=city)
+                    if qs and isinstance(qs, list) and len(qs) and isinstance(qs[0], dict):
+                        return Response(qs, status=status.HTTP_200_OK)
+                    attractions = list(qs)
+                    serializer = self.serializer_class(attractions, many=True)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
 
-            results = AttractionsController.search(request.query_params)
+            # Has query or location - use search() method
+            results = AttractionsController.search(params)
             if results and isinstance(results, list) and len(results) and isinstance(results[0], dict):
                 return Response(results, status=status.HTTP_200_OK)
             attractions = list(results)
@@ -298,19 +348,46 @@ class CompilationViewSet(viewsets.ViewSet):
 
     @action(detail=True, methods=['post'])
     def remove_item(self, request, pk=None):
+        import traceback
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
+            logger.debug(f"remove_item request: pk={pk}, data={request.data}, user={getattr(request, 'user', None)}")
+            
             # Enforce ownership
             try:
                 comp = Compilation.objects.get(id=pk)
                 user = getattr(request, 'user', None)
                 if user and getattr(comp, 'owner', None) and str(getattr(comp.owner, 'id', '')) != str(getattr(user, 'id', '')):
                     return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
-            except Exception:
-                pass
-            data = CompilationsController.remove_item(pk, request.data)
-            return Response(data)
-        except Exception as e:
-            import traceback
+            except Exception as e:
+                logger.debug(f"Ownership check error (non-fatal): {e}")
+            
+            try:
+                data = CompilationsController.remove_item(pk, request.data)
+                logger.debug(f"remove_item success: returning {len(data.get('items', []))} items")
+                return Response(data)
+            except (ValidationError, NotFound) as e:
+                logger.warning(f"remove_item ValidationError/NotFound: {e}")
+                return Response({'error': str(e), 'details': traceback.format_exc()}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                logger.error(f"remove_item error in controller: {e}")
+                logger.error(traceback.format_exc())
+                raise  # Re-raise to be caught by outer handler
+                
+        except (ValidationError, NotFound) as e:
             return Response({'error': str(e), 'details': traceback.format_exc()}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Error in remove_item endpoint")
+            error_msg = str(e)
+            error_details = traceback.format_exc()
+            logger.error(f"Full error details: {error_details}")
+            return Response({
+                'error': error_msg, 
+                'details': error_details,
+                'request_data': str(request.data),
+                'pk': str(pk)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 

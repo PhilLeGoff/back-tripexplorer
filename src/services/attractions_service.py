@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple, List
+import hashlib
+import json
 
 from ..external_services import google_places_service
 from ..models import Attraction
+from ..repositories.attraction_repository import AttractionRepository
 
+
+# Simple in-memory cache for search results (valid for 5 minutes)
+_search_cache: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
+_CACHE_TTL = 5 * 60  # 5 minutes
 
 class AttractionsService:
+    @staticmethod
+    def _filter_opening_hours(opening_hours: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Filter opening hours to only include open_now and weekday_text."""
+        if not opening_hours or not isinstance(opening_hours, dict):
+            return {}
+        
+        filtered = {}
+        
+        if 'open_now' in opening_hours:
+            filtered['open_now'] = opening_hours['open_now']
+        
+        if 'weekday_text' in opening_hours:
+            filtered['weekday_text'] = opening_hours['weekday_text']
+        
+        return filtered
+    
     @staticmethod
     def _map_place_to_attraction(place: Dict[str, Any], country_hint: Optional[str] = None) -> Dict[str, Any]:
         """Map a Google Places result (or details result) to our API attraction shape without saving."""
@@ -15,7 +38,6 @@ class AttractionsService:
         lat = loc.get('lat')
         lng = loc.get('lng')
 
-        # Try to extract country and city from address components when present
         country = country_hint
         city = None
         for comp in place.get('address_components', []) or []:
@@ -25,7 +47,6 @@ class AttractionsService:
             if ('locality' in types or 'postal_town' in types) and not city:
                 city = comp.get('long_name')
 
-        # Fallbacks
         formatted_address = place.get('formatted_address') or place.get('vicinity') or ''
         name = place.get('name', '')
 
@@ -46,13 +67,12 @@ class AttractionsService:
             'phone_number': place.get('formatted_phone_number', ''),
             'photo_reference': None,
             'photos_count': len(place.get('photos', []) or []),
-            'opening_hours': place.get('opening_hours', {}),
+            'opening_hours': AttractionsService._filter_opening_hours(place.get('opening_hours')),
             'reviews': place.get('reviews', []) or [],
             'likes': 0,
             'is_featured': False,
             'raw_data': place,
         }
-        # If photos exist, set reference to first photo's photo_reference when available
         photos = place.get('photos') or []
         if photos:
             mapped['photo_reference'] = photos[0].get('photo_reference')
@@ -60,17 +80,71 @@ class AttractionsService:
         return mapped
 
     @staticmethod
-    def popular_by_country(country: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Return popular attractions for a country by querying Google Places (not MongoDB)."""
-        # Use Google Places text search for tourist attractions in the country
-        places = google_places_service.search_attractions_by_country(country, limit=limit)
+    def popular_by_country(country: str, limit: int = 20, profile: str = 'tourist', city: str = None) -> List[Dict[str, Any]]:
+        """Return popular attractions for a country (and optionally city) by querying Google Places (not MongoDB).
+        
+        Profile-specific adaptations:
+        - tourist: prioritize tourist_attraction types, landmarks, museums
+        - local: prioritize restaurants, cafes, parks, local favorites
+        - pro: prioritize business centers, conference venues, corporate amenities
+        """
+        # Use Google Places text search for attractions in the country/city (profile-aware)
+        places = google_places_service.search_attractions_by_country(country, limit=limit * 2, profile=profile, city=city)
         mapped = [AttractionsService._map_place_to_attraction(p, country_hint=country) for p in places]
-        return mapped
+        
+        if profile == 'tourist':
+            tourist_types = ['tourist_attraction', 'point_of_interest', 'museum', 'art_gallery', 'church', 'park', 'zoo', 'amusement_park']
+            mapped.sort(key=lambda x: (
+                -sum(1 for t in (x.get('types') or []) if any(tt in t.lower() for tt in tourist_types)),
+                -(x.get('rating', 0)),
+                -(x.get('user_ratings_total', 0))
+            ))
+        elif profile == 'local':
+            local_types = ['restaurant', 'cafe', 'bar', 'park', 'gym', 'store', 'shopping_mall', 'supermarket', 'library', 'movie_theater']
+            mapped.sort(key=lambda x: (
+                -sum(1 for t in (x.get('types') or []) if any(lt in t.lower() for lt in local_types)),
+                -(x.get('rating', 0)),
+                -(x.get('user_ratings_total', 0))
+            ))
+        elif profile == 'pro':
+            pro_types = ['lodging', 'establishment', 'point_of_interest', 'train_station', 'airport', 'gas_station', 'bank', 'atm']
+            mapped.sort(key=lambda x: (
+                -sum(1 for t in (x.get('types') or []) if any(pt in t.lower() for pt in pro_types)),
+                -(x.get('rating', 0)),
+                -(x.get('user_ratings_total', 0))
+            ))
+        
+        return mapped[:limit]
 
     @staticmethod
+    def _generate_cache_key(params: Dict[str, Any]) -> str:
+        """Generate a cache key from search parameters."""
+        sorted_params = json.dumps(params, sort_keys=True)
+        return hashlib.md5(sorted_params.encode()).hexdigest()
+    
+    @staticmethod
     def search(params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Search attractions via Google Places based on query params. Does not persist results."""
-        # Build query and location
+        """Search attractions via Google Places based on query params. Does not persist results.
+        
+        Profile-based adaptations:
+        - tourist: prioritize tourist attractions, landmarks, high ratings
+        - local: prioritize local spots, restaurants, cafes, parks
+        - pro: prioritize business amenities, hotels, transportation hubs
+        """
+        import time
+        
+        # Check cache first
+        cache_key = AttractionsService._generate_cache_key(params)
+        current_time = time.time()
+        
+        if cache_key in _search_cache:
+            cached_results, cache_time = _search_cache[cache_key]
+            if current_time - cache_time < _CACHE_TTL:
+                logger = __import__('logging').getLogger(__name__)
+                logger.info(f"[Search] Using cached results for key={cache_key[:8]}...")
+                return cached_results
+        
+        profile = params.get('profile', 'tourist')
         query = (params.get('q') or '').strip()
         place_type = params.get('type')
         country = params.get('country')
@@ -91,40 +165,269 @@ class AttractionsService:
         except (TypeError, ValueError):
             radius = None
 
-        # If no query and no location, avoid calling text search with empty query which triggers INVALID_REQUEST
+        category = params.get('category')
+        min_rating = params.get('min_rating') or params.get('minRating')
+        price_level = params.get('price_level') or params.get('maxPrice')
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        has_category = bool(category and category.strip())
+        has_min_rating = False
+        if min_rating:
+            try:
+                if isinstance(min_rating, (int, float)):
+                    has_min_rating = min_rating > 0
+                elif isinstance(min_rating, str) and min_rating.strip():
+                    has_min_rating = float(min_rating.strip()) > 0
+            except (ValueError, TypeError):
+                pass
+        
+        has_price_level = False
+        if price_level:
+            try:
+                if isinstance(price_level, int):
+                    has_price_level = price_level < 200
+                elif isinstance(price_level, str) and price_level.strip():
+                    has_price_level = int(price_level.strip()) < 200
+            except (ValueError, TypeError):
+                pass
+        
+        has_filters = has_category or has_min_rating or has_price_level
+
+        requested_types = []
+        place_type = None
+        if category and category.strip():
+            requested_types = [c.strip() for c in category.split(',') if c.strip()]
+            if requested_types:
+                place_type = requested_types[0]
+        if not place_type and not has_filters:
+            if profile == 'tourist':
+                place_type = 'tourist_attraction'
+            elif profile == 'local':
+                place_type = None
+            elif profile == 'pro':
+                place_type = None
+
         if not query and not location:
             if country:
-                # Fall back to country-wide attractions search
-                places = google_places_service.search_attractions_by_country(country, limit=int(params.get('limit', 50)))
-                mapped = [AttractionsService._map_place_to_attraction(p, country_hint=country) for p in places]
-                return mapped
+                if has_filters:
+                    if requested_types and place_type:
+                        type_name = requested_types[0].replace('_', ' ')
+                        if city:
+                            text_query = f"{type_name} in {city}, {country}" if country else f"{type_name} in {city}"
+                        elif country:
+                            text_query = f"{type_name} in {country}"
+                        else:
+                            text_query = type_name
+                        logger.info(f"[Search] Filters applied with no query - using query='{text_query}' and place_type='{place_type}'")
+                        results = google_places_service.search_places(query=text_query, location=None, radius=None, place_type=place_type)
+                        mapped = [AttractionsService._map_place_to_attraction(p, country_hint=country) for p in results]
+                        logger.info(f"[Search] Got {len(mapped)} results after filter search with place_type={place_type}")
+                        # Continue to apply filters and ranking below
+                    else:
+                        # No category filter, but other filters present - fall back to profile-based search
+                        mapped = AttractionsService.popular_by_country(country, limit=int(params.get('limit', 50)), profile=profile, city=city)
+                        # Cache results before returning
+                        _search_cache[cache_key] = (mapped, current_time)
+                        return mapped
+                else:
+                    # Fall back to country-wide or city-wide attractions search (profile-aware)
+                    mapped = AttractionsService.popular_by_country(country, limit=int(params.get('limit', 50)), profile=profile, city=city)
+                    # Cache results before returning
+                    _search_cache[cache_key] = (mapped, current_time)
+                    return mapped
             else:
                 # Nothing to search for
                 import logging
                 logging.getLogger(__name__).warning("Search called with empty query and no location/country; returning empty list")
-                return []
-
-        # If we have a lat/lng, use nearby search; otherwise, use places text search
-        if location:
-            lat, lng = location
-            # googlemaps client expects (lat, lng) or string "lat,lng"
-            loc_param = (lat, lng)
-            results = google_places_service.search_places(query=query, location=loc_param, radius=radius, place_type=place_type)
+                empty_result: List[Dict[str, Any]] = []
+                _search_cache[cache_key] = (empty_result, current_time)
+                return empty_result
+        
+        if 'mapped' not in locals():
+            if location:
+                lat, lng = location
+                loc_param = (lat, lng)
+                search_query = query if query else None
+                if not has_filters and query:
+                    if profile == 'local':
+                        search_query = f"{query} local favorites"
+                    elif profile == 'pro':
+                        search_query = f"{query} business"
+                    else:
+                        search_query = query
+                db_results = []
+                try:
+                    repo_results = AttractionRepository.search(
+                        text=search_query or '',
+                        location=location,
+                        radius_m=radius or 5000,
+                        place_type=place_type,
+                        limit=50
+                    )
+                    db_results = list(repo_results)
+                    logger.info(f"[Search] Found {len(db_results)} results in MongoDB")
+                except Exception as e:
+                    logger.debug(f"[Search] MongoDB search error: {e}")
+                
+                google_results = google_places_service.search_places(query=search_query, location=loc_param, radius=radius, place_type=place_type)
+                
+                google_place_ids = {r.get('place_id') for r in google_results if r.get('place_id')}
+                results = google_results
+                
+                for db_attraction in db_results[:10]:
+                    if db_attraction.place_id not in google_place_ids:
+                        try:
+                            db_dict = {
+                                'place_id': db_attraction.place_id,
+                                'name': db_attraction.name,
+                                'formatted_address': db_attraction.formatted_address,
+                                'rating': db_attraction.rating,
+                                'user_ratings_total': db_attraction.user_ratings_total,
+                                'price_level': db_attraction.price_level,
+                                'types': db_attraction.types or [],
+                                'photos': [],
+                                'reviews': db_attraction.reviews or [],
+                                'website': db_attraction.website or '',
+                                'formatted_phone_number': db_attraction.phone_number or '',
+                                'opening_hours': db_attraction.opening_hours or {},
+                                'geometry': {}
+                            }
+                            if db_attraction.location and hasattr(db_attraction.location, 'coordinates'):
+                                coords = db_attraction.location.coordinates
+                                if len(coords) >= 2:
+                                    db_dict['geometry'] = {'location': {'lat': coords[1], 'lng': coords[0]}}
+                            results.append(db_dict)
+                        except Exception as e:
+                            logger.debug(f"[Search] Error converting MongoDB result: {e}")
+            else:
+                if query and not city and not country and (" " not in query.strip()) and not has_filters:
+                    mapped = AttractionsService.popular_by_country(query.strip(), limit=int(params.get('limit', 50)), profile=profile)
+                    _search_cache[cache_key] = (mapped, current_time)
+                    return mapped
+                if has_filters and place_type:
+                    text_query = None
+                    if requested_types:
+                        type_name = requested_types[0].replace('_', ' ')
+                        if city:
+                            text_query = f"{type_name} in {city}, {country}" if country else f"{type_name} in {city}"
+                        elif country:
+                            text_query = f"{type_name} in {country}"
+                        else:
+                            text_query = type_name
+                else:
+                    text_query = query
+                    if not has_filters:
+                        if profile == 'tourist' and text_query:
+                            text_query = f"{text_query} tourist attractions"
+                        elif profile == 'local' and text_query:
+                            text_query = f"{text_query} local spots"
+                        elif profile == 'pro' and text_query:
+                            text_query = f"{text_query} business"
+                    if city:
+                        text_query = f"{text_query} in {city}" if text_query else f"{city}"
+                    elif country:
+                        text_query = f"{text_query} in {country}" if text_query else f"{country}"
+                results = google_places_service.search_places(query=text_query, location=None, radius=None, place_type=place_type)
+            
+            mapped = [AttractionsService._map_place_to_attraction(p, country_hint=country) for p in results]
+        
+        if requested_types:
+            filtered_mapped = []
+            for place in mapped:
+                place_types = place.get('types', []) or []
+                matches = False
+                for req_type in requested_types:
+                    req_lower = req_type.lower()
+                    for pt in place_types:
+                        pt_str = str(pt).lower()
+                        if req_lower == pt_str or req_lower in pt_str or pt_str in req_lower:
+                            matches = True
+                            break
+                    if matches:
+                        break
+                if matches:
+                    filtered_mapped.append(place)
+            
+            logger.info(f"[Search] After category filtering: {len(filtered_mapped)} results remain (filtered out {len(mapped) - len(filtered_mapped)})")
+            if filtered_mapped:
+                sample_types_after = [place.get('types', [])[:3] for place in filtered_mapped[:3]]
+                logger.info(f"[Search] Sample place types after category filtering: {sample_types_after}")
+            mapped = filtered_mapped
+        
+        # Filter by minimum rating if specified (applies to both text and location-based searches)
+        min_rating_value = None
+        if min_rating:
+            try:
+                min_rating_value = float(min_rating)
+                if min_rating_value > 0:
+                    before_count = len(mapped)
+                    mapped = [p for p in mapped if p.get('rating', 0) >= min_rating_value]
+                    logger.info(f"[Search] Rating filter (>{min_rating_value}): {before_count} -> {len(mapped)} results")
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by maximum price level if specified (applies to both text and location-based searches)
+        price_level_value = None
+        if price_level:
+            try:
+                price_level_value = int(price_level)
+                # Only filter if price level is less than 200 (meaningful filter)
+                if price_level_value < 200:
+                    before_count = len(mapped)
+                    # Keep places with price_level <= filter OR places with no price_level (null)
+                    mapped = [p for p in mapped if (p.get('price_level') is not None and p.get('price_level') <= price_level_value) or p.get('price_level') is None]
+                    logger.info(f"[Search] Price filter (<={price_level_value}): {before_count} -> {len(mapped)} results")
+            except (ValueError, TypeError):
+                pass
+        
+        # Recalculate has_filters after parsing to ensure we have meaningful filter values
+        has_filters = bool(
+            requested_types or 
+            (min_rating_value and min_rating_value > 0) or 
+            (price_level_value and price_level_value < 200)
+        )
+        
+        logger.info(f"[Search] Final filter status - has_filters={has_filters}, category_types={len(requested_types) if requested_types else 0}, min_rating={min_rating_value}, price_level={price_level_value}, location_search={location is not None}")
+        logger.info(f"[Search] Final result count: {len(mapped)} attractions after all filters applied")
+        
+        # Apply ranking: use filter-based ranking if filters are applied, otherwise use profile-based ranking
+        if has_filters:
+            # Generic ranking: prioritize by rating and number of reviews when filters are used
+            mapped.sort(key=lambda x: (
+                -(x.get('rating', 0)),
+                -(x.get('user_ratings_total', 0))
+            ))
         else:
-            # Heuristic: if user typed a single token and no explicit city/country provided, treat the query as a country name.
-            if query and not city and not country and (" " not in query.strip()):
-                places = google_places_service.search_attractions_by_country(query.strip(), limit=int(params.get('limit', 50)))
-                mapped = [AttractionsService._map_place_to_attraction(p, country_hint=query.strip()) for p in places]
-                return mapped
-            # If no coordinates, broaden text search, include city/country if provided
-            text_query = query
-            if city:
-                text_query = f"{text_query} in {city}" if text_query else f"{city}"
-            if country:
-                text_query = f"{text_query} in {country}" if text_query else f"{country}"
-            results = google_places_service.search_places(query=text_query, location=None, radius=None, place_type=place_type)
-
-        mapped = [AttractionsService._map_place_to_attraction(p, country_hint=country) for p in results]
+            if profile == 'tourist':
+                tourist_types = ['tourist_attraction', 'point_of_interest', 'museum', 'art_gallery', 'church', 'park', 'zoo', 'amusement_park']
+                mapped.sort(key=lambda x: (
+                    -sum(1 for t in (x.get('types') or []) if any(tt in t.lower() for tt in tourist_types)),
+                    -(x.get('rating', 0)),
+                    -(x.get('user_ratings_total', 0))
+                ))
+            elif profile == 'local':
+                local_types = ['restaurant', 'cafe', 'bar', 'park', 'gym', 'store', 'shopping_mall', 'supermarket', 'library', 'movie_theater']
+                mapped.sort(key=lambda x: (
+                    -sum(1 for t in (x.get('types') or []) if any(lt in t.lower() for lt in local_types)),
+                    -(x.get('rating', 0)),
+                    -(x.get('user_ratings_total', 0))
+                ))
+            elif profile == 'pro':
+                pro_types = ['lodging', 'establishment', 'point_of_interest', 'train_station', 'airport', 'gas_station', 'bank', 'atm']
+                mapped.sort(key=lambda x: (
+                    -sum(1 for t in (x.get('types') or []) if any(pt in t.lower() for pt in pro_types)),
+                    -(x.get('rating', 0)),
+                    -(x.get('user_ratings_total', 0))
+                ))
+        
+        _search_cache[cache_key] = (mapped, current_time)
+        
+        if len(_search_cache) > 50:
+            sorted_cache = sorted(_search_cache.items(), key=lambda x: x[1][1])
+            for old_key, _ in sorted_cache[:-50]:
+                del _search_cache[old_key]
+        
         return mapped
 
     @staticmethod
@@ -135,7 +438,6 @@ class AttractionsService:
         details = google_places_service.get_place_details(place_id)
         if not details:
             return None
-        # Derive country for mapping when possible
         country = None
         for comp in details.get('address_components', []) or []:
             if 'country' in (comp.get('types') or []):
@@ -145,22 +447,15 @@ class AttractionsService:
 
     @staticmethod
     def similar_suggestions(place_id: str, limit: int = 10):
-        """Compute similar suggestions using Google only (no DB).
-
-        Strategy: fetch details to get geometry and types, then run a nearby/text search
-        with the top type/category and return mapped results.
-        """
+        """Compute similar suggestions using Google only (no DB)."""
         base = AttractionsService.get_by_place_id(place_id)
         if not base:
             return []
-        # Prefer nearby search by coordinates when available
         mapped: list = []
         geometry = base.get('location')
         primary_type = (base.get('types') or [None])[0]
         if geometry and 'lat' in geometry and 'lng' in geometry:
-            # Use keyword = name's first word or category to bias results
             keyword = base.get('name', '').split(' ')[0] if base.get('name') else None
-            # google_places_service.search_places accepts location tuple and radius
             results = google_places_service.search_places(
                 query=keyword or primary_type or 'tourist attraction',
                 location=(geometry['lat'], geometry['lng']),
@@ -176,12 +471,10 @@ class AttractionsService:
                 place_type=primary_type or 'tourist_attraction',
             )
             mapped = [AttractionsService._map_place_to_attraction(r, country_hint=base.get('country')) for r in results[:limit]]
-        # Filter out the base place if present
         return [m for m in mapped if m.get('place_id') != place_id][:limit]
 
     @staticmethod
     def sync_from_google(country: str, limit: int = 20):
-        # Keep existing sync behavior (admin/manual) — this persists to MongoDB
         places = google_places_service.search_attractions_by_country(country, limit)
         synced = 0
         for place in places:
@@ -212,7 +505,7 @@ class AttractionsService:
             if lat is not None and lng is not None:
                 attraction.location = {'type': 'Point', 'coordinates': [lng, lat]}
             attraction.photos_count = len(details.get('photos', []) or [])
-            attraction.opening_hours = details.get('opening_hours', {})
+            attraction.opening_hours = AttractionsService._filter_opening_hours(details.get('opening_hours'))
             attraction.website = details.get('website', '')
             attraction.phone_number = details.get('formatted_phone_number', '')
             attraction.types = details.get('types', []) or []
@@ -280,7 +573,7 @@ class AttractionsService:
                     attraction.photo_reference = ref
         except Exception:
             pass
-        attraction.opening_hours = details.get('opening_hours', {})
+        attraction.opening_hours = AttractionsService._filter_opening_hours(details.get('opening_hours'))
         attraction.website = details.get('website', '')
         attraction.phone_number = details.get('formatted_phone_number', '')
         attraction.types = details.get('types', []) or []
